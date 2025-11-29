@@ -15,6 +15,7 @@
     vm_name_prefix: "{{ vm_name_prefix }}"
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
     vm_keypair: "k8s"
+
     os_auth_url: "https://10.1.71.88:5000/v3"
     os_project_name: "admin"
     os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
@@ -28,34 +29,33 @@
 
   tasks:
 
-    - name: Validate vm_count is a positive integer
+    - name: Validate vm_count
       fail:
-        msg: "vm_count must be a positive integer. Got {{ vm_count }}."
+        msg: "vm_count must be positive"
       when: vm_count < 1
 
-    - name: Convert roles list
+    - name: Convert roles to list
       set_fact:
         parsed_roles: "{{ node_roles.split(',') }}"
 
-    - name: Validate role count
+    - name: Ensure roles count matches VM count
       assert:
         that:
           - parsed_roles | length == vm_count
 
-    - name: Generate VM index list
+    - name: Generate VM numbers
       set_fact:
-        vm_list: "{{ query('sequence', 'start=1 end=' + vm_count|string) }}"
+        vm_list: "{{ query('sequence','start=1 end=' + vm_count|string) }}"
 
-    - name: Create VM-role mapping
+    - name: Create map of VM index → role
       set_fact:
         vm_role_map: "{{ vm_list | zip(parsed_roles) | list }}"
 
-    - name: Debug mapping
-      debug:
-        msg: "VM {{ vm_name_prefix }}-{{ item.0 }} → role(s): {{ item.1 }}"
+    - debug:
+        msg: "VM {{ vm_name_prefix }}-{{ item.0 }} gets role {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
-    - name: Get cluster ID
+    - name: Get Rancher cluster
       uri:
         url: "{{ rancher_url }}/v3/clusters?name={{ cluster_name }}"
         method: GET
@@ -65,13 +65,12 @@
         validate_certs: no
       register: cluster_info
 
-    - name: Fail if cluster not found
+    - name: Fail if cluster missing
       fail:
-        msg: "Cluster '{{ cluster_name }}' not found"
+        msg: "Cluster not found"
       when: cluster_info.json.data | length == 0
 
-    - name: Set cluster ID
-      set_fact:
+    - set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
     - name: Create registration token
@@ -81,14 +80,14 @@
         headers:
           Authorization: "Bearer {{ rancher_token }}"
           Content-Type: "application/json"
+        validate_certs: no
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
-        validate_certs: no
       register: token_create
       ignore_errors: yes
 
-    - name: Wait for registration token
+    - name: Wait for nodeCommand
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
         method: GET
@@ -97,20 +96,18 @@
           Content-Type: "application/json"
         validate_certs: no
       register: reg_info
-      until: reg_info.json.data[0].nodeCommand is defined
+      until: reg_info.json.data[0].nodeCommand is defined and reg_info.json.data[0].nodeCommand != ""
       retries: 20
       delay: 5
 
-    - name: Extract node command
-      set_fact:
+    - set_fact:
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
         registration_token: "{{ reg_info.json.data[0].token }}"
 
-    - name: Debug node command
-      debug:
+    - debug:
         msg: "NODE COMMAND: {{ node_command }}"
 
-    - name: Create cloud-init files
+    - name: Create cloud-init for each VM
       copy:
         dest: "/tmp/cloud-init-{{ vm_name_prefix }}-{{ item.0 }}.yml"
         content: |
@@ -119,43 +116,41 @@
           packages:
             - curl
             - docker.io
+            - jq
+            - iptables
+            - conntrack
+            - nfs-common
+            - apparmor-utils
+
+          write_files:
+            - path: /etc/hosts
+              content: |
+                10.1.77.17 k8smanager.comtegra.pl
+              owner: root:root
+              permissions: '0644'
 
           runcmd:
             - echo "Node: {{ vm_name_prefix }}-{{ item.0 }}"
             - echo "Role: {{ item.1 }}"
-            - echo "Cluster: {{ cluster_name }}"
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
-            - sleep 10
+            - sleep 5
             - curl -k -I {{ rancher_url }}
+
             - |
-              BASE_CMD="{{ node_command }}"
-              MODIFIED_CMD=$(echo "$BASE_CMD" | sed 's/curl /curl --insecure /g')
-              FINAL_CMD="$MODIFIED_CMD"
-              {{ 'FINAL_CMD=\"$FINAL_CMD --etcd\"' if 'etcd' in item.1 else '' }}
-              {{ 'FINAL_CMD=\"$FINAL_CMD --controlplane\"' if 'controlplane' in item.1 else '' }}
-              {{ 'FINAL_CMD=\"$FINAL_CMD --worker\"' if 'worker' in item.1 else '' }}
-              FINAL_CMD="$FINAL_CMD --node-name {{ vm_name_prefix }}-{{ item.0 }}"
-              eval $FINAL_CMD
+              BASE="{{ node_command }}"
+              BASE=$(echo "$BASE" | sed 's/curl /curl --insecure /g')
+              FINAL="$BASE"
+
+              {% if 'etcd' in item.1 %}FINAL="$FINAL --etcd"{% endif %}
+              {% if 'controlplane' in item.1 %}FINAL="$FINAL --controlplane"{% endif %}
+              {% if 'worker' in item.1 %}FINAL="$FINAL --worker"{% endif %}
+
+              FINAL="$FINAL --node-name {{ vm_name_prefix }}-{{ item.0 }}"
+              echo "Running: $FINAL"
+              eval $FINAL
       loop: "{{ vm_role_map }}"
-
-    - name: Save manual registration commands
-      copy:
-        dest: "/tmp/{{ cluster_name }}-manual-commands.txt"
-        content: |
-          Cluster: {{ cluster_name }}
-          Prefix: {{ vm_name_prefix }}
-
-          {% for vm in vm_role_map %}
-          {{ vm_name_prefix }}-{{ vm.0 }} ({{ vm.1 }})
-          {{ node_command | replace('curl ', 'curl --insecure ') }}\
-          {% if 'etcd' in vm.1 %} --etcd{% endif %}\
-          {% if 'controlplane' in vm.1 %} --controlplane{% endif %}\
-          {% if 'worker' in vm.1 %} --worker{% endif %}\
-          --node-name {{ vm_name_prefix }}-{{ vm.0 }}
-          {% endfor %}
-      delegate_to: localhost
 
     - name: Create VMs
       openstack.cloud.server:
@@ -165,10 +160,10 @@
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
         network: "{{ vm_net }}"
-        userdata: "{{ lookup('file', '/tmp/cloud-init-' + vm_name_prefix + '-' + item.0|string + '.yml') }}"
+        userdata: "{{ lookup('file','/tmp/cloud-init-' + vm_name_prefix + '-' + item.0|string + '.yml') }}"
         auto_ip: yes
-        timeout: 600
         wait: yes
+        timeout: 600
         validate_certs: false
       environment:
         OS_AUTH_URL: "{{ os_auth_url }}"
@@ -184,11 +179,11 @@
       register: new_vms
       loop: "{{ vm_role_map }}"
 
-    - name: Show created VM details
+    - name: Show VM details safely
       debug:
         msg: >
-          Created {{ vm_name_prefix }}-{{ item.0 }}
-          with IP: {{
+          VM {{ vm_name_prefix }}-{{ item.0 }}
+          IP: {{
             new_vms.results[item.0 | int - 1].server.addresses
             | dict2items
             | map(attribute='value')
