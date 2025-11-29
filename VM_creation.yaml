@@ -81,10 +81,10 @@
         headers:
           Authorization: "Bearer {{ rancher_token }}"
           Content-Type: "application/json"
-        validate_certs: no
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
+        validate_certs: no
       register: token_create
       ignore_errors: yes
 
@@ -124,14 +124,11 @@
             - echo "Node: {{ vm_name_prefix }}-{{ item.0 }}"
             - echo "Role: {{ item.1 }}"
             - echo "Cluster: {{ cluster_name }}"
-
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
             - sleep 10
-
             - curl -k -I {{ rancher_url }}
-
             - |
               BASE_CMD="{{ node_command }}"
               MODIFIED_CMD=$(echo "$BASE_CMD" | sed 's/curl /curl --insecure /g')
@@ -189,7 +186,19 @@
 
     - name: Show created VM details
       debug:
-        msg: "Created {{ vm_name_prefix }}-{{ item.0 }} with IP: {{ new_vms.results[item.0 | int - 1].server.public_v4 }}"
+        msg: >
+          Created {{ vm_name_prefix }}-{{ item.0 }}
+          with IP: {{
+            new_vms.results[item.0 | int - 1].server.addresses
+            | dict2items
+            | map(attribute='value')
+            | list
+            | first
+            | map(attribute='addr')
+            | list
+            | first
+            | default('No IP assigned')
+          }}
       loop: "{{ vm_role_map }}"
 
     - name: Cleanup cloud-init files
