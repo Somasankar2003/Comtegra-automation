@@ -179,11 +179,11 @@
       register: new_vms
       loop: "{{ vm_role_map }}"
 
-    - name: Show VM details safely
+    - name: Show created VM details
       debug:
         msg: >
-          VM {{ vm_name_prefix }}-{{ item.0 }}
-          IP: {{
+          Created {{ vm_name_prefix }}-{{ item.0 }}
+          with IP: {{
             new_vms.results[item.0 | int - 1].server.addresses
             | dict2items
             | map(attribute='value')
