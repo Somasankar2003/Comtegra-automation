@@ -314,7 +314,7 @@
 
     - name: Wait for VMs to get IP addresses
       pause:
-        minutes: 2
+        minutes: 5
       when: new_vms is defined
 
     - name: Check VM creation results
@@ -352,7 +352,7 @@
         validate_certs: no
       register: cluster_check
       until: cluster_check.json.appliedSpec.rancherKubernetesEngineConfig is defined
-      retries: 30
+      retries: 300
       delay: 10
       ignore_errors: yes
 
@@ -365,7 +365,7 @@
         validate_certs: no
       register: node_status
       until: node_status.json.data | length >= vm_count
-      retries: 40
+      retries: 400
       delay: 15
       ignore_errors: yes
 
@@ -388,7 +388,7 @@
       until:
         - cluster_state.json.state == "active"
         - (cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) == "True"
-      retries: 60
+      retries: 600
       delay: 15
 
     - name: Show final cluster status
