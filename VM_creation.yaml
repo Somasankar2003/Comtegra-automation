@@ -5,23 +5,19 @@
   gather_facts: no
 
   vars:
-    # Rancher details
     rancher_url: "https://k8smanager.comtegra.pl"
     rancher_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
     cluster_name: "{{ cluster_name }}"
 
-    # Survey variables from AWX
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
     vm_name_prefix: "{{ vm_name_prefix }}"
 
-    # Static VM details
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
     vm_keypair: "k8s"
 
-    # OpenStack authentication
     os_auth_url: "https://10.1.71.88:5000/v3"
     os_project_name: "admin"
     os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
@@ -62,7 +58,7 @@
         vm_role_map: "{{ vm_list | zip(parsed_roles) | list }}"
 
     - debug:
-        msg: "VM {{ vm_name_prefix }}-{{ item.0 }} will be {{ item.1 }}"
+        msg: "VM {{ vm_name_prefix.split(',')[item.0 | int - 1] }} will be {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
@@ -141,7 +137,7 @@
 
     - name: Create cloud-init files
       copy:
-        dest: "/tmp/cloud-init-{{ vm_name_prefix }}-{{ item.0 }}.yml"
+        dest: "/tmp/cloud-init-{{ vm_name_prefix.split(',')[item.0 | int - 1] }}.yml"
         content: |
           #cloud-config
           package_update: true
@@ -162,57 +158,23 @@
               permissions: '0644'
 
           runcmd:
-            - echo "=== Starting Node Registration for {{ vm_name_prefix }}-{{ item.0 }} as {{ item.1 }} ==="
+            - echo "=== Starting Node Registration for {{ vm_name_prefix.split(',')[item.0 | int - 1] }} as {{ item.1 }} ==="
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
             - sleep 10
 
             - |
-              # Debug: Show registration command
-              echo "Original node command: {{ node_command[:100] }}..."
-              echo "Token: {{ registration_token[:10] }}..."
-              
-              # Create final registration command
               BASE="{{ node_command }}"
-              # Make curl insecure for self-signed certs
               BASE=$(echo "$BASE" | sed 's/curl /curl -k /g')
               FINAL="$BASE"
-              
-              # Add roles
               {% if 'etcd' in item.1 %}FINAL="$FINAL --etcd"{% endif %}
               {% if 'controlplane' in item.1 %}FINAL="$FINAL --controlplane"{% endif %}
               {% if 'worker' in item.1 %}FINAL="$FINAL --worker"{% endif %}
-              
-              # Add node name
-              FINAL="$FINAL --node-name {{ vm_name_prefix }}-{{ item.0 }}"
-              
-              # Debug output
-              echo "Final command (masked): $(echo "$FINAL" | sed 's/token=[^ ]*/token=*****/g')"
-              
-              # Save and execute with retry logic
-              cat > /tmp/register.sh << 'EOF'
-              #!/bin/bash
-              MAX_RETRIES=15
-              RETRY_DELAY=20
-              
-              for i in $(seq 1 $MAX_RETRIES); do
-                echo "Registration attempt $i/$MAX_RETRIES"
-                if eval "$1"; then
-                  echo "✅ Registration successful!"
-                  exit 0
-                fi
-                echo "❌ Attempt failed, retrying in $RETRY_DELAY seconds..."
-                sleep $RETRY_DELAY
-              done
-              echo "❌ Registration failed after $MAX_RETRIES attempts"
-              exit 1
-              EOF
-              
-              chmod +x /tmp/register.sh
-              /tmp/register.sh "$FINAL"
-              
-            - echo "=== Node registration completed ==="
+              FINAL="$FINAL --node-name {{ vm_name_prefix.split(',')[item.0 | int - 1] }}"
+              echo "$FINAL" > /tmp/cmd.sh
+              bash /tmp/cmd.sh
+
             - docker ps
       loop: "{{ vm_role_map }}"
 
@@ -223,12 +185,12 @@
     - name: Create VM on OpenStack
       openstack.cloud.server:
         state: present
-        name: "{{ vm_name_prefix }}-{{ item.0 }}"
+        name: "{{ vm_name_prefix.split(',')[item.0 | int - 1] }}"
         image: "{{ vm_image }}"
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
         network: "{{ vm_net }}"
-        userdata: "{{ lookup('file', '/tmp/cloud-init-' + vm_name_prefix + '-' + item.0|string + '.yml') }}"
+        userdata: "{{ lookup('file', '/tmp/cloud-init-' + vm_name_prefix.split(',')[item.0 | int - 1] + '.yml') }}"
         auto_ip: yes
         wait: yes
         timeout: 600
@@ -255,27 +217,63 @@
     - name: Display VM information
       debug:
         msg: |
-          VM {{ vm_name_prefix }}-{{ item.0 }} created
+          VM {{ vm_name_prefix.split(',')[item.0 | int - 1] }} created
           Status: {{ new_vms.results[item.0 | int - 1].server.status | default('Unknown') }}
           ID: {{ new_vms.results[item.0 | int - 1].server.id | default('Unknown') }}
-          
-          {% if new_vms.results[item.0 | int - 1].server.addresses is defined %}
-          Networks:
-          {% for network_name, addresses in new_vms.results[item.0 | int - 1].server.addresses.items() %}
-            - {{ network_name }}: 
-          {% for addr in addresses %}
-              - {{ addr.addr }} ({{ addr.version }})
-          {% endfor %}
-          {% endfor %}
-          {% else %}
-          IP: Not assigned yet
-          {% endif %}
       loop: "{{ vm_role_map }}"
       when: new_vms is defined and new_vms.results[item.0 | int - 1] is defined
 
+    ###########################################################################
+    # WAIT FOR CLUSTER ACTIVATION
+    ###########################################################################
+
+    - name: Wait for nodes to register in Rancher
+      uri:
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: rancher_nodes
+      until: rancher_nodes.json.data | length >= vm_count
+      retries: 500
+      delay: 10
+      ignore_errors: yes
+
+    - debug:
+        msg: "Found {{ rancher_nodes.json.data | length }} nodes in Rancher"
+
+    - name: Wait for cluster to become active
+      uri:
+        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: cluster_state
+      until: 
+        - cluster_state.json.state == "active"
+        - cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == "True"
+      retries: 600
+      delay: 10
+
+    - name: Show final cluster status
+      debug:
+        msg: |
+          ✅ CLUSTER ACTIVE!
+          Cluster: {{ cluster_name }}
+
+    ###########################################################################
+    # CLEANUP
+    ###########################################################################
+
     - name: Remove cloud-init temp files
       file:
-        path: "/tmp/cloud-init-{{ vm_name_prefix }}-{{ item.0 }}.yml"
+        path: "/tmp/cloud-init-{{ vm_name_prefix.split(',')[item.0 | int - 1] }}.yml"
         state: absent
       loop: "{{ vm_role_map }}"
 
+    - name: Final success message
+      debug:
+        msg: |
+          🎉 SUCCESS! Cluster {{ cluster_name }} is now fully operational.
