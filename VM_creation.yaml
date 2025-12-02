@@ -248,22 +248,30 @@
       loop: "{{ vm_role_map }}"
       ignore_errors: yes
 
-    - name: Display VM IP addresses
+    ###########################################################################
+    # DISPLAY VM INFO
+    ###########################################################################
+
+    - name: Display VM information
       debug:
-        msg: >
-          VM {{ vm_name_prefix }}-{{ item.0 }} → IP: {{
-            (new_vms.results[item.0 | int - 1].server.accessIPv4 
-            if new_vms.results[item.0 | int - 1].server.accessIPv4 
-            else new_vms.results[item.0 | int - 1].server.networks 
-            | dict2items 
-            | map(attribute='value') 
-            | flatten 
-            | first 
-            if new_vms.results[item.0 | int - 1].server.networks 
-            else 'No IP assigned')
-          }}
+        msg: |
+          VM {{ vm_name_prefix }}-{{ item.0 }} created
+          Status: {{ new_vms.results[item.0 | int - 1].server.status | default('Unknown') }}
+          ID: {{ new_vms.results[item.0 | int - 1].server.id | default('Unknown') }}
+          
+          {% if new_vms.results[item.0 | int - 1].server.addresses is defined %}
+          Networks:
+          {% for network_name, addresses in new_vms.results[item.0 | int - 1].server.addresses.items() %}
+            - {{ network_name }}: 
+          {% for addr in addresses %}
+              - {{ addr.addr }} ({{ addr.version }})
+          {% endfor %}
+          {% endfor %}
+          {% else %}
+          IP: Not assigned yet
+          {% endif %}
       loop: "{{ vm_role_map }}"
-      when: new_vms is defined
+      when: new_vms is defined and new_vms.results[item.0 | int - 1] is defined
 
     ###########################################################################
     # WAIT FOR CLUSTER ACTIVATION
