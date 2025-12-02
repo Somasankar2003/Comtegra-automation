@@ -35,6 +35,9 @@
 
   tasks:
 
+    ###########################################################################
+    # VALIDATION
+    ###########################################################################
     - name: Validate vm_count
       fail:
         msg: "vm_count must be positive"
@@ -61,6 +64,10 @@
     - debug:
         msg: "VM {{ vm_name_prefix }}-{{ item.0 }} will be {{ item.1 }}"
       loop: "{{ vm_role_map }}"
+
+    ###########################################################################
+    # RANCHER API CALLS
+    ###########################################################################
 
     - name: Get Rancher cluster info
       uri:
@@ -128,6 +135,9 @@
     - debug:
         msg: "Node command obtained successfully (token: {{ registration_token[:10] }}...)"
 
+    ###########################################################################
+    # CLOUD-INIT GENERATION WITH FIXES
+    ###########################################################################
 
     - name: Create cloud-init files
       copy:
@@ -279,6 +289,9 @@
             
       loop: "{{ vm_role_map }}"
 
+    ###########################################################################
+    # CREATE VMS WITH CONFIGURATION FIXES
+    ###########################################################################
 
     - name: Create VM on OpenStack
       openstack.cloud.server:
@@ -293,8 +306,6 @@
         wait: true
         timeout: 900
         config_drive: true  # Important for cloud-init
-        boot_volume: null
-        volumes: null
         security_groups: default
         validate_certs: false
       environment:
@@ -314,8 +325,12 @@
 
     - name: Wait for VMs to get IP addresses
       pause:
-        minutes: 5
+        minutes: 2
       when: new_vms is defined
+
+    ###########################################################################
+    # DISPLAY VM INFORMATION
+    ###########################################################################
 
     - name: Check VM creation results
       debug:
@@ -343,6 +358,10 @@
       loop: "{{ vm_role_map }}"
       when: new_vms is defined
 
+    ###########################################################################
+    # WAIT FOR CLUSTER ACTIVATION WITH BETTER MONITORING
+    ###########################################################################
+
     - name: Wait for cluster to show nodes (initial)
       uri:
         url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
@@ -352,7 +371,7 @@
         validate_certs: no
       register: cluster_check
       until: cluster_check.json.appliedSpec.rancherKubernetesEngineConfig is defined
-      retries: 300
+      retries: 30
       delay: 10
       ignore_errors: yes
 
@@ -365,7 +384,7 @@
         validate_certs: no
       register: node_status
       until: node_status.json.data | length >= vm_count
-      retries: 400
+      retries: 40
       delay: 15
       ignore_errors: yes
 
@@ -388,7 +407,7 @@
       until:
         - cluster_state.json.state == "active"
         - (cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first) == "True"
-      retries: 600
+      retries: 60
       delay: 15
 
     - name: Show final cluster status
@@ -415,8 +434,32 @@
             Message: {{ condition.message | default('OK') }}
           {% endfor %}
 
+    ###########################################################################
+    # CLEANUP
+    ###########################################################################
+
     - name: Remove cloud-init temp files
       file:
         path: "/tmp/cloud-init-{{ vm_name_prefix }}-{{ item.0 }}.yml"
         state: absent
       loop: "{{ vm_role_map }}"
+
+    - name: Final success message
+      debug:
+        msg: |
+          🎉 SUCCESS! Cluster deployment completed.
+          ========================================
+          Cluster: {{ cluster_name }}
+          Status: ACTIVE ✓
+          Nodes Created: {{ vm_count }}
+          Roles: {{ node_roles }}
+          
+          Next steps:
+          1. Access Rancher UI: {{ rancher_url }}
+          2. Check cluster: {{ rancher_url }}/dashboard/c/{{ cluster_id }}/explorer
+          3. Monitor nodes: kubectl get nodes
+          
+          Troubleshooting:
+          - Check VM logs: SSH to nodes and check /var/log/cloud-init-output.log
+          - Check registration: /var/log/rancher-registration.log on each node
+          - Verify network connectivity between nodes and Rancher server
