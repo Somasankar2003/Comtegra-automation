@@ -15,7 +15,7 @@
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
-    vm_name_prefix: "rancher-node"
+    vm_name_prefix: "{{ vm_name_prefix }}"
 
     # Static VM details
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
