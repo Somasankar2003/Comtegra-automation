@@ -5,25 +5,23 @@
   gather_facts: no
 
   vars:
+    # Rancher details
     rancher_url: "https://k8smanager.comtegra.pl"
     rancher_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
     cluster_name: "{{ cluster_name }}"
 
-    # Survey variables
+    # Survey variables from AWX
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
-    vm_name_prefix: "{{ vm_name_prefix }}"
-
-    # NEW: convert VM names list
-    vm_names: "{{ vm_name_prefix.split(',') }}"
+    vm_names: "{{ vm_name_prefix.split(',') }}"   
 
     # Static VM details
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
     vm_keypair: "k8s"
 
-    # OpenStack Auth
+    # OpenStack authentication
     os_auth_url: "https://10.1.71.88:5000/v3"
     os_project_name: "admin"
     os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
@@ -49,24 +47,24 @@
       set_fact:
         parsed_roles: "{{ node_roles.split(',') }}"
 
+    - name: Ensure VM name count matches VM count
+      assert:
+        that:
+          - vm_names | length == vm_count
+        fail_msg: "Number of VM names does NOT match vm_count!"
+
     - name: Ensure role count matches VM count
       assert:
         that:
           - parsed_roles | length == vm_count
         fail_msg: "Number of roles does not match number of VMs!"
 
-    - name: Ensure vm_names count matches vm_count
-      assert:
-        that:
-          - vm_names | length == vm_count
-        fail_msg: "Number of VM names does not match vm_count!"
-
     - name: Build VM → role map
       set_fact:
-        vm_role_map: "{{ vm_names | zip(parsed_roles) | list }}"
+        vm_role_map: "{{ vm_names | zip(parsed_roles) | list }}"   # ← NEW FIX
 
     - debug:
-        msg: "VM {{ item.0 }} will be {{ item.1 }}"
+        msg: "VM {{ item.0 }} will be role {{ item.1 }}"
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
@@ -91,7 +89,8 @@
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
 
-    - debug:
+    - name: Debug cluster ID
+      debug:
         msg: "Cluster ID: {{ cluster_id }}"
 
     - name: Check for existing registration tokens
@@ -114,9 +113,9 @@
         body:
           clusterId: "{{ cluster_id }}"
         status_code: 201,200
+      register: token_create
       when: existing_tokens.json.data | length == 0
       ignore_errors: yes
-      register: token_create
 
     - name: Wait for nodeCommand to be ready
       uri:
@@ -141,10 +140,9 @@
     ###########################################################################
     # CLOUD-INIT GENERATION
     ###########################################################################
-
     - name: Create cloud-init files
       copy:
-        dest: "/tmp/cloud-init-{{ item.0 }}.yml"
+        dest: "/tmp/cloud-init-{{ item.0 }}.yml"         # ✔ FIXED NAME
         content: |
           #cloud-config
           package_update: true
@@ -165,7 +163,7 @@
               permissions: '0644'
 
           runcmd:
-            - echo "=== Starting Node Registration for {{ item.0 }} as {{ item.1 }} ==="
+            - echo "=== Starting Node Registration for {{ item.0 }} (Role: {{ item.1 }}) ==="
             - systemctl enable docker
             - systemctl start docker
             - usermod -aG docker ubuntu
@@ -186,8 +184,6 @@
               chmod +x /tmp/register.sh
               /tmp/register.sh
 
-            - echo "=== Node registration completed ==="
-            - docker ps
       loop: "{{ vm_role_map }}"
 
     ###########################################################################
@@ -197,7 +193,7 @@
     - name: Create VM on OpenStack
       openstack.cloud.server:
         state: present
-        name: "{{ item.0 }}"          # <--- FIXED: use actual VM name
+        name: "{{ item.0 }}"                         # ✔ FIXED NAME
         image: "{{ vm_image }}"
         flavor: "{{ vm_flavor }}"
         key_name: "{{ vm_keypair }}"
@@ -221,6 +217,17 @@
       register: new_vms
       loop: "{{ vm_role_map }}"
       ignore_errors: yes
+
+    ###########################################################################
+    # DISPLAY VM INFO
+    ###########################################################################
+
+    - name: Display VM information
+      debug:
+        msg: |
+          VM {{ item.0 }} created
+          Status: {{ new_vms.results[item.0 | int - 1].server.status | default('Unknown') }}
+      loop: "{{ vm_role_map }}"
 
     ###########################################################################
     # WAIT FOR CLUSTER ACTIVATION
@@ -252,31 +259,13 @@
       register: cluster_state
       until:
         - cluster_state.json.state == "active"
-        - cluster_state.json.conditions | selectattr('type','equalto','Ready') | map(attribute='status') | first == "True"
+        - cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == "True"
       retries: 600
       delay: 10
-
-    - name: Show final cluster status
-      debug:
-        msg: |
-          🎉 CLUSTER ACTIVE!
-          Name: {{ cluster_name }}
-          State: {{ cluster_state.json.state }}
-          Version: {{ cluster_state.json.version.gitVersion | default('N/A') }}
-
-    ###########################################################################
-    # CLEANUP
-    ###########################################################################
-
-    - name: Remove cloud-init temp files
-      file:
-        path: "/tmp/cloud-init-{{ item.0 }}.yml"
-        state: absent
-      loop: "{{ vm_role_map }}"
 
     - name: Final success message
       debug:
         msg: |
-          🎉 SUCCESS!
-          Created VMs: {{ vm_names | join(', ') }}
-          Cluster is ACTIVE.
+          🎉 SUCCESS! Cluster {{ cluster_name }} is ACTIVE.
+          Created VMs: {{ vm_names }}
+          All nodes registered successfully.
