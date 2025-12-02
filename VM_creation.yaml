@@ -5,19 +5,23 @@
   gather_facts: no
 
   vars:
+    # Rancher details
     rancher_url: "https://k8smanager.comtegra.pl"
     rancher_token: "token-p8htt:zmjjkpcfzb5gdrmq5djfsm4wrzszk9kb8fbqjpng9pvkmqm4fz762w"
     cluster_name: "{{ cluster_name }}"
 
+    # Survey variables from AWX
     vm_count: "{{ vm_count | int }}"
     node_roles: "{{ node_roles }}"
     vm_net: "{{ vm_net }}"
     vm_flavor: "{{ vm_flavor }}"
     vm_name_prefix: "{{ vm_name_prefix }}"
 
+    # Static VM details
     vm_image: "4e04bf46-b48f-4bd2-a15a-efdd3a666d43"
     vm_keypair: "k8s"
 
+    # OpenStack authentication
     os_auth_url: "https://10.1.71.88:5000/v3"
     os_project_name: "admin"
     os_project_id: "e9f88faebaa44e3893fd26f9d41f9927"
@@ -31,6 +35,9 @@
 
   tasks:
 
+    ###########################################################################
+    # VALIDATION
+    ###########################################################################
     - name: Validate vm_count
       fail:
         msg: "vm_count must be positive"
@@ -44,6 +51,7 @@
       assert:
         that:
           - parsed_roles | length == vm_count
+        fail_msg: "Number of roles does not match number of VMs!"
 
     - name: Generate VM numbers
       set_fact:
@@ -56,6 +64,10 @@
     - debug:
         msg: "VM {{ vm_name_prefix }}-{{ item.0 }} will be {{ item.1 }}"
       loop: "{{ vm_role_map }}"
+
+    ###########################################################################
+    # RANCHER API CALLS
+    ###########################################################################
 
     - name: Get Rancher cluster info
       uri:
@@ -71,11 +83,22 @@
         msg: "Cluster {{ cluster_name }} not found in Rancher!"
       when: cluster_info.json.data | length == 0
 
-    - name: Set cluster ID
+    - name: Set Rancher cluster ID
       set_fact:
         cluster_id: "{{ cluster_info.json.data[0].id }}"
+      debug:
+        msg: "Cluster ID: {{ cluster_info.json.data[0].id }}"
 
-    - name: Create registration token
+    - name: Check for existing registration tokens
+      uri:
+        url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: existing_tokens
+
+    - name: Create Rancher registration token if needed
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens"
         method: POST
@@ -85,10 +108,12 @@
         body_format: json
         body:
           clusterId: "{{ cluster_id }}"
-        status_code: 201
+        status_code: 201,200
       register: token_create
+      when: existing_tokens.json.data | length == 0
+      ignore_errors: yes
 
-    - name: Wait for nodeCommand
+    - name: Wait for nodeCommand to be ready
       uri:
         url: "{{ rancher_url }}/v3/clusterRegistrationTokens?clusterId={{ cluster_id }}"
         method: GET
@@ -100,10 +125,17 @@
       retries: 20
       delay: 5
 
-    - name: Store registration data
+    - name: Store node command and token
       set_fact:
         node_command: "{{ reg_info.json.data[0].nodeCommand }}"
         registration_token: "{{ reg_info.json.data[0].token }}"
+
+    - debug:
+        msg: "Node command obtained successfully (token: {{ registration_token[:10] }}...)"
+
+    ###########################################################################
+    # CLOUD-INIT GENERATION
+    ###########################################################################
 
     - name: Create cloud-init files
       copy:
@@ -114,6 +146,11 @@
           packages:
             - curl
             - docker.io
+            - jq
+            - iptables
+            - conntrack
+            - nfs-common
+            - apparmor-utils
 
           write_files:
             - path: /etc/hosts
@@ -123,21 +160,63 @@
               permissions: '0644'
 
           runcmd:
+            - echo "=== Starting Node Registration for {{ vm_name_prefix }}-{{ item.0 }} as {{ item.1 }} ==="
             - systemctl enable docker
             - systemctl start docker
-            - sleep 5
-            - curl --insecure -I {{ rancher_url }}
+            - usermod -aG docker ubuntu
+            - sleep 10
+
             - |
+              # Debug: Show registration command
+              echo "Original node command: {{ node_command[:100] }}..."
+              echo "Token: {{ registration_token[:10] }}..."
+              
+              # Create final registration command
               BASE="{{ node_command }}"
-              FINAL=$(echo "$BASE" | sed 's/curl /curl --insecure /g')
+              # Make curl insecure for self-signed certs
+              BASE=$(echo "$BASE" | sed 's/curl /curl -k /g')
+              FINAL="$BASE"
+              
+              # Add roles
               {% if 'etcd' in item.1 %}FINAL="$FINAL --etcd"{% endif %}
               {% if 'controlplane' in item.1 %}FINAL="$FINAL --controlplane"{% endif %}
               {% if 'worker' in item.1 %}FINAL="$FINAL --worker"{% endif %}
+              
+              # Add node name
               FINAL="$FINAL --node-name {{ vm_name_prefix }}-{{ item.0 }}"
-              echo "$FINAL" > /root/rancher-final.sh
-              chmod +x /root/rancher-final.sh
-            - bash /root/rancher-final.sh
+              
+              # Debug output
+              echo "Final command (masked): $(echo "$FINAL" | sed 's/token=[^ ]*/token=*****/g')"
+              
+              # Save and execute with retry logic
+              cat > /tmp/register.sh << 'EOF'
+              #!/bin/bash
+              MAX_RETRIES=15
+              RETRY_DELAY=20
+              
+              for i in $(seq 1 $MAX_RETRIES); do
+                echo "Registration attempt $i/$MAX_RETRIES"
+                if eval "$1"; then
+                  echo "✅ Registration successful!"
+                  exit 0
+                fi
+                echo "❌ Attempt failed, retrying in $RETRY_DELAY seconds..."
+                sleep $RETRY_DELAY
+              done
+              echo "❌ Registration failed after $MAX_RETRIES attempts"
+              exit 1
+              EOF
+              
+              chmod +x /tmp/register.sh
+              /tmp/register.sh "$FINAL"
+              
+            - echo "=== Node registration completed ==="
+            - docker ps
       loop: "{{ vm_role_map }}"
+
+    ###########################################################################
+    # CREATE VMS
+    ###########################################################################
 
     - name: Create VM on OpenStack
       openstack.cloud.server:
@@ -165,17 +244,86 @@
         OS_IDENTITY_API_VERSION: "{{ os_identity_api_version }}"
       register: new_vms
       loop: "{{ vm_role_map }}"
+      ignore_errors: yes
 
-    - name: Show VM IPs
+    - name: Display VM IP addresses
       debug:
-        msg: "VM {{ vm_name_prefix }}-{{ item.0 }} → IP: {{
-          new_vms.results[item.0 | int - 1].server.public_v4 |
-          default(new_vms.results[item.0 | int - 1].server.private_v4)
-        }}"
+        msg: >
+          VM {{ vm_name_prefix }}-{{ item.0 }} → IP: {{
+            (new_vms.results[item.0 | int - 1].server.accessIPv4 
+            if new_vms.results[item.0 | int - 1].server.accessIPv4 
+            else new_vms.results[item.0 | int - 1].server.networks 
+            | dict2items 
+            | map(attribute='value') 
+            | flatten 
+            | first 
+            if new_vms.results[item.0 | int - 1].server.networks 
+            else 'No IP assigned')
+          }}
       loop: "{{ vm_role_map }}"
+      when: new_vms is defined
 
-    - name: Cleanup cloud-init files
+    ###########################################################################
+    # WAIT FOR CLUSTER ACTIVATION
+    ###########################################################################
+
+    - name: Wait for nodes to register in Rancher
+      uri:
+        url: "{{ rancher_url }}/v3/nodes?clusterId={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: rancher_nodes
+      until: rancher_nodes.json.data | length >= vm_count
+      retries: 30
+      delay: 10
+      ignore_errors: yes
+
+    - debug:
+        msg: "Found {{ rancher_nodes.json.data | length }} nodes in Rancher"
+
+    - name: Wait for cluster to become active
+      uri:
+        url: "{{ rancher_url }}/v3/clusters/{{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ rancher_token }}"
+        validate_certs: no
+      register: cluster_state
+      until: 
+        - cluster_state.json.state == "active"
+        - cluster_state.json.conditions | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first == "True"
+      retries: 60
+      delay: 10
+
+    - name: Show final cluster status
+      debug:
+        msg: |
+          ✅ CLUSTER ACTIVE!
+          Cluster: {{ cluster_name }}
+          State: {{ cluster_state.json.state }}
+          Kubernetes Version: {{ cluster_state.json.version.gitVersion | default('N/A') }}
+          Node Count: {{ cluster_state.json.appliedSpec.rancherKubernetesEngineConfig.nodes | length | default(0) }}
+          
+          Conditions:
+          {% for condition in cluster_state.json.conditions %}
+            - {{ condition.type }}: {{ condition.status }} ({{ condition.message | default('OK') }})
+          {% endfor %}
+
+    ###########################################################################
+    # CLEANUP
+    ###########################################################################
+
+    - name: Remove cloud-init temp files
       file:
         path: "/tmp/cloud-init-{{ vm_name_prefix }}-{{ item.0 }}.yml"
         state: absent
       loop: "{{ vm_role_map }}"
+
+    - name: Final success message
+      debug:
+        msg: |
+          🎉 SUCCESS! Cluster {{ cluster_name }} is now fully operational.
+          Created {{ vm_count }} VMs: {{ vm_role_map | map(attribute='0') | list | join(', ') }}
+          All nodes registered and cluster is ACTIVE.
